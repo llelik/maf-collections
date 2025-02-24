@@ -1,0 +1,127 @@
+##########################################################################
+#
+# - check for existing volumes and generate new volume name incremented by 1
+# - setting other naming dependencies for:
+#   - qtree
+#   - export policy
+#   - source and vault volumes
+#   - volume type (snaplock)
+# Alexey Mikhaylov
+# NetApp Deutschland GmbH
+# Professional Services 2024-2025
+##########################################################################
+---
+- name: Pre-flight setup
+  block:
+    - name: Set cluster credentials 
+      ansible.builtin.set_fact:
+        auth: &auth
+          username:        "{{ ontap_username | default(omit) }}"
+          password:        "{{ ontap_password | default(omit) }}"
+          validate_certs:  "{{ auth_rest_validate_certs | default(false) }}"
+          use_rest:        always
+          use_python_keys: true
+      no_log: true
+    - debug: var=vars_local
+######### Incrementing volume name by 1
+# We retrieve existing volumes with generated name pattern without last 2 digits
+# This should give a list of volumes named vol01,vol02,vol03 etc. (filetr=vol*)
+# We then increment the last 2 digits by 1
+#######################################
+    - name: Collecting existing volumes on all clusters against default volume name "{{ vars_local.source.volume.name | default('None') }}"
+      netapp.ontap.na_ontap_rest_info:
+        <<: *auth
+        hostname: "{{ cluster_ip }}"
+        gather_subset:
+          - volume_info
+        parameters:
+          name: "{{ vars_local.source.volume.name[:-2] }}*"
+        fields:
+          - name
+      register: existing_vols
+      loop: "{{ inventory_svms_mcc.hosts | map(attribute='cluster_mgmt') | list | unique }}"
+      loop_control:
+        loop_var: cluster_ip
+      no_log: "{{ nolog }}"
+    
+######### Incrementing volume name by 1 cont.
+# We build a list of volumes if received
+# sort them and take the last one
+# if return empty list if no volumes found by the pattern
+#######################################
+    - name: Set existing volumes list
+      ansible.builtin.set_fact:
+        existing_volumes_list: "{{ existing_volumes_list | default([]) + item.ontap_info.storage_volumes.records | map(attribute='name') | list | sort}}"
+      loop: "{{ existing_vols.results }}"
+      no_log: "{{ nolog }}"
+
+######### Incrementing volume name by 1 cont.
+# Inceremting the last volume name by 1
+# if list is empty we return empty var
+#######################################
+    - name: Set new volume name
+      ansible.builtin.set_fact:
+        new_volume_name: "{{ existing_volumes_list | netapp_ps.bper.increment_names(1) }}"
+    - debug:
+        msg: "Volume with default base name {{ vars_local.source.volume.name | default('None') }} is not found existing - this name will be used for target volume name"
+      when: existing_volumes_list | length == 0
+
+######## Setting source volume destination aggreate
+# Collecting aggrgates available 
+# of the given Snaplock type across the inventory
+#######################################
+
+    - name: Get available aggregates of requested type 
+      netapp.ontap.na_ontap_rest_info:
+        <<: *auth
+        hostname: "{{ cluster_ip }}"
+        gather_subset:
+          - aggregate_info
+        fields:
+          - name
+        parameters:
+          snaplock_type:   "{{ '!non_snaplock' if input_snaplock | bool else vars_local.source.volume.snaplock.type }}"
+      no_log: "{{ nolog }}"
+      loop: "{{ inventory_svms_mcc.hosts | map(attribute='cluster_mgmt') | list | unique }}"
+      loop_control:
+        loop_var: cluster_ip
+      register: aggregates_supported
+ 
+    - debug: 
+        msg: "Found {{ aggregates_supported.results | selectattr('ontap_info.storage_aggregates.num_records', '>', 0) | map(attribute='ontap_info.storage_aggregates.num_records' ) | sum }} aggregates of requested Snaplock type {{ vars_local.source.volume.snaplock.type }} on all inventory clusters"
+
+    ######### Inventory of clusters with supported aggregates of requested Snaplock type 
+    # contains the list of clusters with supported aggregates 
+    # taken from the list of all clusters which have aggregates of given Snaplock type records > 0
+    - name: Define cluster list with supported aggregate type
+      set_fact:
+        aggr_supported_inventory: "{{ aggregates_supported.results | selectattr('ontap_info.storage_aggregates.num_records', '>', 0) | map(attribute='cluster_ip') | list }}"
+
+######### Incrementing volume name by 1 cont.
+# if list was empty - new_volume_name is set to None 
+# then we use default volume name vol01, qtree and exp policy (from defaults)
+# also generate qtree, exp policy names accodingly if needed
+#######################################
+    - name: Define incremented volume name specification
+      ansible.builtin.set_fact:
+        vars_local_update:
+          source:
+            volume:
+              name:          "{{ vars_local.source.volume.name if new_volume_name == '' else new_volume_name }}"
+              junction_path: "/{{ vars_local.source.volume.name if new_volume_name == '' else new_volume_name }}"
+              export_policy:
+                name:        "Q_{{ vars_local.source.volume.name if new_volume_name == '' else new_volume_name }}"
+            export_policy:
+              name:        "Q_{{ vars_local.source.volume.name if new_volume_name == '' else new_volume_name }}"
+            qtree:
+              name:          "Q_{{ vars_local.source.volume.name if new_volume_name == '' else new_volume_name }}"
+              export_policy: "Q_{{ vars_local.source.volume.name if new_volume_name == '' else new_volume_name }}"
+      #when: existing_volumes_list | length > 0
+    
+    - name: Merging logic found facts with vars_local
+      ansible.builtin.set_fact:
+        vars_local: "{{ vars_local | default({}) | combine(vars_local_update, recursive=true)}}"
+      #when: existing_volumes_list | length > 0
+    
+  when: inventory_svms_mcc.keys() | length > 0
+...
